@@ -1,0 +1,144 @@
+import serial
+import mysql.connector
+from datetime import datetime
+import logging
+import time
+import requests
+
+# Set up logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+# Initialize serial communication
+ser = serial.Serial('/dev/ttyUSB0', 9600, timeout=1)
+
+# MySQL database connection
+db = mysql.connector.connect(
+    host="192.168.43.52",
+    user="capstone",
+    password="Ricof#30",
+    database="capstone2"
+)
+cursor = db.cursor()
+
+# Initialize previous water level
+previous_water_level = None
+
+def get_all_contacts():
+    """Fetch all contacts from the database."""
+    cursor.execute("SELECT phone_number FROM contacts WHERE status = 1")
+    contacts = cursor.fetchall()
+    return [contact[0] for contact in contacts]  # Return a list of phone numbers
+
+def send_sms(message, phone_number):
+    api_key = 'ef0a9cf7d5bf8f4b43bbdac91a2f1276'  # Replace with your Semaphore API key
+    url = 'https://semaphore.co/api/v4/messages'
+
+    # Prepare the parameters for the API request
+    parameters = {
+        'apikey': api_key,
+        'number': phone_number,
+        'message': message,
+        'sendername': 'eLogTech'
+    }
+
+    try:
+        response = requests.post(url, data=parameters)
+
+        if response.status_code == 200:
+            logging.info("Message sent successfully.")
+        else:
+            logging.error(f"Message failed with status code: {response.status_code}")
+            logging.error(f"Response: {response.text}")
+    except requests.RequestException as e:
+        logging.error(f"Error sending SMS: {e}")
+
+def insert_sent_message(message):
+    sql = "INSERT INTO sent_message (message) VALUES (%s)"
+    val = (message,)
+    cursor.execute(sql, val)
+    db.commit()
+    logging.info(f"Message inserted into database: {message}")
+
+def update_sensor_status(sensor_type, status):
+    cursor.execute("SELECT * FROM sensors WHERE sensor_type = %s ORDER BY last_update DESC LIMIT 1", (sensor_type,))
+    sensor = cursor.fetchone()
+    
+    trimmed_status = status[:50]
+    
+    if sensor:
+        current_status = sensor[2]
+        
+        if current_status != status:
+            sql = "INSERT INTO sensors (sensor_type, status, last_update) VALUES (%s, %s, NOW())"
+            val = (sensor_type, trimmed_status)
+            cursor.execute(sql, val)
+            db.commit()
+            logging.info(f"Sensor {sensor_type} status changed to {trimmed_status} and inserted into database.")
+
+            if current_status == 'inactive' and status == 'active':
+                logging.info(f"Sensor {sensor_type} is now active.")
+            elif current_status == 'active' and status == 'inactive':
+                logging.info(f"Sensor {sensor_type} is now inactive.")
+        else:
+            logging.info(f"Sensor status remains unchanged: {sensor_type} - {status}")
+    else:
+        sql = "INSERT INTO sensors (sensor_type, status, last_update) VALUES (%s, %s, NOW())"
+        val = (sensor_type, trimmed_status)
+        cursor.execute(sql, val)
+        db.commit()
+        logging.info(f"Sensor {sensor_type} not found in the database. Inserted new record with status {trimmed_status}.")
+
+def insert_water_data(water_level):
+    current_time = datetime.now().strftime('%H:%M:%S')
+    current_date = datetime.now().strftime('%Y-%m-%d')
+    cursor.execute("INSERT INTO water_data (time, date, waterlevel) VALUES (%s, %s, %s)",
+                   (current_time, current_date, water_level))
+    db.commit()
+    logging.info(f"Water level {water_level} saved to database at {current_time} on {current_date}")
+
+def insert_rainfall_data(rainfall, duration):
+    current_time = datetime.now().strftime('%H:%M:%S')
+    current_date = datetime.now().strftime('%Y-%m-%d')
+    cursor.execute("INSERT INTO rainfall (date, rainfall, duration) VALUES (%s, %s, %s)",
+                   (current_date, rainfall, duration))
+    db.commit()
+    logging.info(f"Rainfall {rainfall} saved to database at {current_time} on {current_date} with duration {duration}")
+
+while True:
+    if ser.in_waiting > 0:
+        data = ser.readline().decode('utf-8').strip()
+        logging.info(f"Raw data received: {repr(data)}")  # Log raw data for debugging
+
+        if data and len(data) > 1:
+            try:
+                if data.startswith('WL:'):
+                    water_level = float(data.split(':')[1].strip())
+                    logging.info(f"Received water level: {water_level} m")
+                    insert_water_data(water_level)
+
+                elif data.startswith('RF:'):
+                    try:
+                        duration = int(data.split(':')[1].strip())
+                        rainfall = 1
+                        insert_rainfall_data(rainfall, duration)
+                    except ValueError:
+                        logging.warning(f"Failed to parse rainfall duration from: {data}")
+
+                elif data.startswith('UL:'):
+                    status = data.split(':')[1].strip()
+                    update_sensor_status('Ultrasonic Sensor', status)
+                elif data.startswith('RS (Analog):'):
+                    status = data.split(':')[1].strip()
+                    update_sensor_status('Rain Sensor', status)
+                elif data.startswith('MS:'):
+                    message = data.split(':', 1)[1].strip()
+                    contacts = get_all_contacts()  # Get all contacts from the database
+                    for contact in contacts:
+                    	send_sms(message, contact)
+                    insert_sent_message(message)
+
+            except (ValueError, IndexError) as e:
+                logging.warning(f"Error processing data: {data} | {e}")
+
+    time.sleep(0)
+
